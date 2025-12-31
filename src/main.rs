@@ -3,7 +3,6 @@ use axum::{
     extract::{Request, State},
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
-    routing::any,
     Router,
 };
 use hyper_util::{client::legacy::Client, rt::TokioExecutor};
