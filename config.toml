@@ -1,0 +1,13 @@
+[proxy]
+host = "0.0.0.0"
+port = 8080
+
+[[domains]]
+domain = "example.local"
+origin = "http://example.com"
+enabled = true
+
+[[domains]]
+domain = "test.local"
+origin = "http://httpbin.org"
+enabled = true

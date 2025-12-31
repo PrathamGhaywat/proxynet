@@ -1,3 +1,5 @@
+mod config;
+
 use axum::{
     body::Body,
     extract::{Request, State},
@@ -9,6 +11,7 @@ use hyper_util::{client::legacy::Client, rt::TokioExecutor};
 use std::{collections::HashMap, sync::Arc};
 use tokio::sync::RwLock;
 use tracing::{info, warn};
+use config::Config;
 
 type HyperClient = Client<hyper_util::client::legacy::connect::HttpConnector, Body>;
 
@@ -26,31 +29,35 @@ async fn main() {
         .compact()
         .init();
 
+    let config = Config::load("config.toml").expect("Failed to load config");
+    info!("Loaded config");
+
     //create http client
     let client = Client::builder(TokioExecutor::new()).build_http();
 
     //config routes. hardcoded for testing rn
     let mut routes = HashMap::new();
-    routes.insert("example.local".to_string(), "http://example.com".to_string());
-    routes.insert("test.local".to_string(), "http://httpbin.org".to_string());
+    for domain in &config.domains {
+        if domain.enabled {
+            routes.insert(domain.domain.clone(), domain.origin.clone());
+            info!("Loaded: {} -> {}", domain.domain, domain.origin);
+        } else {
+            info!{"Skipped (disabled): {}", domain.domain};
+        }
+    }
 
-    let config = ProxyConfig {
+    let proxy_config = ProxyConfig {
         routes: Arc::new(RwLock::new(routes)),
         client,
     };
 
-    info!("Configured routes:");
-    for (domain, origin) in config.routes.read().await.iter() {
-        info!("  {} → {}", domain, origin);
-    }
-
     //build router
     let app = Router::new()
         .fallback(proxy_handler)
-        .with_state(config);
+        .with_state(proxy_config);
 
     //start server
-    let addr = "0.0.0.0:8080";
+    let addr = format!("{}:{}", config.proxy.host, config.proxy.port);
     info!("Proxy started on http://{}", addr);
 
     let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
