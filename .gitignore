@@ -28,3 +28,6 @@ vite.config.ts.timestamp-*
 
 # ignore IDE files
 .vscode/
+
+# SQLite DB
+proxynet.db

@@ -1,5 +1,6 @@
 mod config;
 mod logger;
+mod database;
 
 use axum::{
     body::Body,
@@ -9,19 +10,22 @@ use axum::{
     Router, 
 };
 use hyper_util::{client::legacy::Client, rt::TokioExecutor};
+use sqlx::sqlite::SqlitePool;
 use std::{collections::HashMap, net::SocketAddr, sync::Arc, time::Instant};
 use tokio::sync::RwLock;
 use tracing::{info, warn};
 use config::Config;
 use logger::RequestLog;
+use database::{init_db, save_log};
 
 
 type HyperClient = Client<hyper_util::client::legacy::connect::HttpConnector, Body>;
 
 #[derive(Clone)]
-struct ProxyConfig {
+struct AppState {
     routes: Arc<RwLock<HashMap<String, String>>>,
     client: HyperClient,
+    db: SqlitePool,
 }
 
 #[tokio::main]
@@ -34,6 +38,10 @@ async fn main() {
 
     let config = Config::load("config.toml").expect("Failed to load config");
     info!("Loaded config from config.toml");
+
+    //init database
+    let db = init_db().await.expect("Failed to initialize database");
+    info!("Database initialized");
 
     //create http client
     let client = Client::builder(TokioExecutor::new()).build_http();
@@ -49,15 +57,16 @@ async fn main() {
         }
     }
 
-    let proxy_config = ProxyConfig {
+    let app_state = AppState {
         routes: Arc::new(RwLock::new(routes)),
         client,
+        db,
     };
 
     //build router
     let app = Router::new()
         .fallback(proxy_handler)
-        .with_state(proxy_config);
+        .with_state(app_state);
 
     //start server
     let addr = format!("{}:{}", config.proxy.host, config.proxy.port);
@@ -73,7 +82,7 @@ async fn main() {
 }
 
 async fn proxy_handler(
-    State(config): State<ProxyConfig>,
+    State(state): State<AppState>,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
     mut req: Request,
@@ -104,7 +113,7 @@ async fn proxy_handler(
     let path = req.uri().path().to_string();
 
     //look up origin for domain
-    let routes = config.routes.read().await;
+    let routes = state.routes.read().await;
     let origin = match routes.get(host) {
         Some(o) => o.clone(),
         None => {
@@ -121,6 +130,7 @@ async fn proxy_handler(
             .with_ip(addr.ip().to_string());
 
             log.log();
+            let _ = save_log(&state.db, &log).await;
 
             return Ok(Response::builder()
                 .status(StatusCode::NOT_FOUND)
@@ -141,7 +151,7 @@ async fn proxy_handler(
     req.headers_mut().remove("host");
 
     //forward req
-    match config.client.request(req).await {
+    match state.client.request(req).await {
         Ok(response) => {
             let status = response.status().as_u16();
             info!("SUCCESS: {} responded with {}", origin, status);
@@ -166,6 +176,12 @@ async fn proxy_handler(
 
             log.log();
 
+            //save to database async
+            let db = state.db.clone();
+            tokio::spawn(async move {
+                let _ = save_log(&db, &log).await;
+            });
+
             Ok(response.into_response())
         }
         Err(e) => {
@@ -182,6 +198,7 @@ async fn proxy_handler(
             .with_ip(addr.ip().to_string());
 
             log.log();
+            let _ = save_log(&state.db, &log).await;
 
             Err(StatusCode::BAD_GATEWAY)
         }
