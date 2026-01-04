@@ -5,7 +5,6 @@ use std::path::Path;
 pub async fn init_db() -> Result<SqlitePool, sqlx::Error> {
     let db_path = "proxynet.db";
     
-    // Ensure the directory exists (though it should for project root)
     if let Some(parent) = Path::new(db_path).parent() {
         std::fs::create_dir_all(parent)?;
     }

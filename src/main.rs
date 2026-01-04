@@ -1,6 +1,7 @@
 mod config;
 mod logger;
 mod database;
+mod cache;
 
 use axum::{
     body::Body,
@@ -9,6 +10,7 @@ use axum::{
     response::{IntoResponse, Response},
     Router, 
 };
+use http_body_util::BodyExt;
 use hyper_util::{client::legacy::Client, rt::TokioExecutor};
 use sqlx::sqlite::SqlitePool;
 use std::{collections::HashMap, net::SocketAddr, sync::Arc, time::Instant};
@@ -17,7 +19,7 @@ use tracing::{info, warn};
 use config::Config;
 use logger::RequestLog;
 use database::{init_db, save_log};
-
+use cache::MemoryCache;
 
 type HyperClient = Client<hyper_util::client::legacy::connect::HttpConnector, Body>;
 
@@ -26,6 +28,7 @@ struct AppState {
     routes: Arc<RwLock<HashMap<String, String>>>,
     client: HyperClient,
     db: SqlitePool,
+    cache: MemoryCache,
 }
 
 #[tokio::main]
@@ -42,6 +45,10 @@ async fn main() {
     //init database
     let db = init_db().await.expect("Failed to initialize database");
     info!("Database initialized");
+
+    //init in-memory cache
+    let cache = MemoryCache::new();
+    info!("In-memory cache initialized");
 
     //create http client
     let client = Client::builder(TokioExecutor::new()).build_http();
@@ -61,6 +68,7 @@ async fn main() {
         routes: Arc::new(RwLock::new(routes)),
         client,
         db,
+        cache,
     };
 
     //build router
@@ -111,6 +119,7 @@ async fn proxy_handler(
 
     let method = req.method().to_string();
     let path = req.uri().path().to_string();
+    let query = req.uri().query();
 
     //look up origin for domain
     let routes = state.routes.read().await;
@@ -140,9 +149,39 @@ async fn proxy_handler(
     };
     drop(routes);
 
+    //check cache for GET requests
+    let cache_key = MemoryCache::generate_cache_key(host, &path, query);
+    if req.method() == "GET" {
+        if let Some(cached_response) = state.cache.get(&cache_key).await {
+            info!("CACHE HIT: {}", cache_key);
+            
+            //log cached request
+            let log = RequestLog::new(
+                host.to_string(),
+                path,
+                method,
+                200,
+                start_time,
+            )
+            .with_ip(addr.ip().to_string());
+
+            log.log();
+            let db = state.db.clone();
+            tokio::spawn(async move {
+                let _ = save_log(&db, &log).await;
+            });
+
+            return Ok(Response::builder()
+                .status(StatusCode::OK)
+                .header("X-Cache", "HIT")
+                .body(Body::from(cached_response))
+                .unwrap());
+        }
+    }
+
     //build upstream url
-    let query = req.uri().query().map(|q| format!("?{}", q)).unwrap_or_default();
-    let upstream_uri = format!("{}{}{}", origin, path, query);
+    let query_part = query.map(|q| format!("?{}", q)).unwrap_or_default();
+    let upstream_uri = format!("{}{}{}", origin, path, query_part);
 
     info!("PROXYING: {} -> {}", host, upstream_uri);
 
@@ -151,10 +190,36 @@ async fn proxy_handler(
     req.headers_mut().remove("host");
 
     //forward req
+    let request_method = req.method().clone();
     match state.client.request(req).await {
         Ok(response) => {
             let status = response.status().as_u16();
             info!("SUCCESS: {} responded with {}", origin, status);
+
+            //cache successful GET responses
+            let should_cache = request_method == "GET" && status == 200;
+            
+            let (parts, body) = response.into_parts();
+            
+            //collect body bytes
+            let body_bytes = match body.collect().await {
+                Ok(collected) => collected.to_bytes(),
+                Err(e) => {
+                    warn!("Failed to read response body: {}", e);
+                    return Err(StatusCode::BAD_GATEWAY);
+                }
+            };
+
+            //cache if applicable
+            if should_cache {
+                if let Ok(body_str) = String::from_utf8(body_bytes.to_vec()) {
+                    let cache = state.cache.clone();
+                    let cache_key = cache_key.clone();
+                    tokio::spawn(async move {
+                        cache.set(cache_key, body_str, 300).await; //5 min TTL
+                    });
+                }
+            }
 
             //log successful request
             let mut log = RequestLog::new(
@@ -182,6 +247,8 @@ async fn proxy_handler(
                 let _ = save_log(&db, &log).await;
             });
 
+            //reconstruct response with cached body
+            let response = Response::from_parts(parts, Body::from(body_bytes));
             Ok(response.into_response())
         }
         Err(e) => {
