@@ -11,6 +11,7 @@ pub struct Config {
 pub struct ProxySettings {
     pub host: String,
     pub port: u16,
+    pub rate_limit_per_minute: Option<u32>,
 }
 
 #[derive(Debug, Deserialize, Clone)]

@@ -2,6 +2,7 @@ mod config;
 mod logger;
 mod database;
 mod cache;
+mod rate_limiter;
 
 use axum::{
     body::Body,
@@ -20,6 +21,7 @@ use config::Config;
 use logger::RequestLog;
 use database::{init_db, save_log};
 use cache::MemoryCache;
+use rate_limiter::RateLimiter;
 
 type HyperClient = Client<hyper_util::client::legacy::connect::HttpConnector, Body>;
 
@@ -29,6 +31,7 @@ struct AppState {
     client: HyperClient,
     db: SqlitePool,
     cache: MemoryCache,
+    rate_limiter: Option<RateLimiter>,
 }
 
 #[tokio::main]
@@ -50,6 +53,14 @@ async fn main() {
     let cache = MemoryCache::new();
     info!("In-memory cache initialized");
 
+    //init rate limiter if configured
+    let rate_limiter = config.proxy.rate_limit_per_minute.map(|limit| {
+        let rl = RateLimiter::new(limit, 60);
+        rl.spawn_cleanup();
+        info!("Rate limiter initialized: {} requests/minute", limit);
+        rl
+    });
+
     //create http client
     let client = Client::builder(TokioExecutor::new()).build_http();
 
@@ -69,6 +80,7 @@ async fn main() {
         client,
         db,
         cache,
+        rate_limiter,
     };
 
     //build router
@@ -120,6 +132,18 @@ async fn proxy_handler(
     let method = req.method().to_string();
     let path = req.uri().path().to_string();
     let query = req.uri().query();
+    let client_ip = addr.ip().to_string();
+
+    //enforce rate limiting if enabled
+    if let Some(rl) = &state.rate_limiter {
+        if !rl.allow(&client_ip).await {
+            warn!("Rate limit exceeded for {}", client_ip);
+            return Ok(Response::builder()
+                .status(StatusCode::TOO_MANY_REQUESTS)
+                .body(Body::from("Too many requests"))
+                .unwrap());
+        }
+    }
 
     //look up origin for domain
     let routes = state.routes.read().await;
@@ -136,7 +160,7 @@ async fn proxy_handler(
                 404,
                 start_time,
             )
-            .with_ip(addr.ip().to_string());
+            .with_ip(client_ip.clone());
 
             log.log();
             let _ = save_log(&state.db, &log).await;
@@ -163,7 +187,7 @@ async fn proxy_handler(
                 200,
                 start_time,
             )
-            .with_ip(addr.ip().to_string());
+            .with_ip(client_ip.clone());
 
             log.log();
             let db = state.db.clone();
@@ -229,7 +253,7 @@ async fn proxy_handler(
                 status,
                 start_time,
             )
-            .with_ip(addr.ip().to_string());
+            .with_ip(client_ip.clone());
 
             if let Some(ua) = user_agent {
                 log = log.with_user_agent(ua);
@@ -262,7 +286,7 @@ async fn proxy_handler(
                 502,
                 start_time,
             )
-            .with_ip(addr.ip().to_string());
+            .with_ip(client_ip);
 
             log.log();
             let _ = save_log(&state.db, &log).await;
