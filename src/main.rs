@@ -100,7 +100,6 @@ async fn main() {
     .await
     .unwrap();
 }
-
 async fn proxy_handler(
     State(state): State<AppState>,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
@@ -160,7 +159,8 @@ async fn proxy_handler(
                 404,
                 start_time,
             )
-            .with_ip(client_ip.clone());
+            .with_ip(client_ip)
+            .with_bytes(0);
 
             log.log();
             let _ = save_log(&state.db, &log).await;
@@ -179,6 +179,8 @@ async fn proxy_handler(
         if let Some(cached_response) = state.cache.get(&cache_key).await {
             info!("CACHE HIT: {}", cache_key);
             
+            let bytes = cached_response.len() as u64;
+
             //log cached request
             let log = RequestLog::new(
                 host.to_string(),
@@ -187,7 +189,8 @@ async fn proxy_handler(
                 200,
                 start_time,
             )
-            .with_ip(client_ip.clone());
+            .with_ip(client_ip)
+            .with_bytes(bytes);
 
             log.log();
             let db = state.db.clone();
@@ -214,33 +217,22 @@ async fn proxy_handler(
     req.headers_mut().remove("host");
 
     //forward req
-    let request_method = req.method().clone();
     match state.client.request(req).await {
         Ok(response) => {
             let status = response.status().as_u16();
             info!("SUCCESS: {} responded with {}", origin, status);
 
-            //cache successful GET responses
-            let should_cache = request_method == "GET" && status == 200;
-            
-            let (parts, body) = response.into_parts();
-            
-            //collect body bytes
-            let body_bytes = match body.collect().await {
-                Ok(collected) => collected.to_bytes(),
-                Err(e) => {
-                    warn!("Failed to read response body: {}", e);
-                    return Err(StatusCode::BAD_GATEWAY);
-                }
-            };
+            let collected = response.into_body().collect().await.map_err(|_| StatusCode::BAD_GATEWAY)?;
+            let bytes = collected.to_bytes();
+            let bytes_len = bytes.len() as u64;
 
-            //cache if applicable
-            if should_cache {
-                if let Ok(body_str) = String::from_utf8(body_bytes.to_vec()) {
+            //cache successful GET responses
+            if method == "GET" && status == 200 {
+                if let Ok(body_str) = String::from_utf8(bytes.to_vec()) {
                     let cache = state.cache.clone();
                     let cache_key = cache_key.clone();
                     tokio::spawn(async move {
-                        cache.set(cache_key, body_str, 300).await; //5 min TTL
+                        cache.set(cache_key, body_str, 300).await;
                     });
                 }
             }
@@ -253,7 +245,8 @@ async fn proxy_handler(
                 status,
                 start_time,
             )
-            .with_ip(client_ip.clone());
+            .with_ip(client_ip)
+            .with_bytes(bytes_len);
 
             if let Some(ua) = user_agent {
                 log = log.with_user_agent(ua);
@@ -271,9 +264,7 @@ async fn proxy_handler(
                 let _ = save_log(&db, &log).await;
             });
 
-            //reconstruct response with cached body
-            let response = Response::from_parts(parts, Body::from(body_bytes));
-            Ok(response.into_response())
+            Ok(Response::new(Body::from(bytes)))
         }
         Err(e) => {
             warn!("ERROR: {}", e);
@@ -286,7 +277,8 @@ async fn proxy_handler(
                 502,
                 start_time,
             )
-            .with_ip(client_ip);
+            .with_ip(client_ip)
+            .with_bytes(0);
 
             log.log();
             let _ = save_log(&state.db, &log).await;
