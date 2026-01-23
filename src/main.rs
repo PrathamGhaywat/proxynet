@@ -3,12 +3,13 @@ mod logger;
 mod database;
 mod cache;
 mod rate_limiter;
+mod api;
 
 use axum::{
     body::Body,
     extract::{ConnectInfo, Request, State},
     http::{HeaderMap, StatusCode},
-    response::{IntoResponse, Response},
+    response::{Response},
     Router, 
 };
 use http_body_util::BodyExt;
@@ -22,6 +23,7 @@ use logger::RequestLog;
 use database::{init_db, save_log};
 use cache::MemoryCache;
 use rate_limiter::RateLimiter;
+use api::api_router;
 
 type HyperClient = Client<hyper_util::client::legacy::connect::HttpConnector, Body>;
 
@@ -83,10 +85,14 @@ async fn main() {
         rate_limiter,
     };
 
+    let api_routes = api_router(app_state.routes.clone(), app_state.db.clone());
+
     //build router
     let app = Router::new()
         .fallback(proxy_handler)
-        .with_state(app_state);
+        .with_state(app_state)
+        .nest("/api", api_routes);
+
 
     //start server
     let addr = format!("{}:{}", config.proxy.host, config.proxy.port);
