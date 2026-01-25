@@ -1,4 +1,3 @@
-mod config;
 mod logger;
 mod database;
 mod cache;
@@ -18,7 +17,6 @@ use sqlx::sqlite::SqlitePool;
 use std::{collections::HashMap, net::SocketAddr, sync::Arc, time::Instant};
 use tokio::sync::RwLock;
 use tracing::{info, warn};
-use config::Config;
 use logger::RequestLog;
 use database::{init_db, save_log};
 use cache::MemoryCache;
@@ -44,19 +42,39 @@ async fn main() {
         .compact()
         .init();
 
-    let config = Config::load("config.toml").expect("Failed to load config");
-    info!("Loaded config from config.toml");
-
-    //init database
+    //init database first
     let db = init_db().await.expect("Failed to initialize database");
     info!("Database initialized");
+
+    //load config from database
+    let host = database::get_config(&db, "host")
+        .await
+        .ok()
+        .flatten()
+        .unwrap_or("0.0.0.0".to_string());
+
+    let port = database::get_config(&db, "port")
+        .await
+        .ok()
+        .flatten()
+        .unwrap_or("8080".to_string())
+        .parse::<u16>()
+        .unwrap_or(8080);
+
+    let rate_limit = database::get_config(&db, "rate_limit_per_minute")
+        .await
+        .ok()
+        .flatten()
+        .and_then(|s| s.parse::<u32>().ok());
+
+    info!("Loaded config from database: {}:{}, rate_limit: {:?}", host, port, rate_limit);
 
     //init in-memory cache
     let cache = MemoryCache::new();
     info!("In-memory cache initialized");
 
-    //init rate limiter if configured
-    let rate_limiter = config.proxy.rate_limit_per_minute.map(|limit| {
+    //init rate limiter
+    let rate_limiter = rate_limit.map(|limit| {
         let rl = RateLimiter::new(limit, 60);
         rl.spawn_cleanup();
         info!("Rate limiter initialized: {} requests/minute", limit);
@@ -66,14 +84,17 @@ async fn main() {
     //create http client
     let client = Client::builder(TokioExecutor::new()).build_http();
 
-    //build routes from config
+    //build routes from database
     let mut routes = HashMap::new();
-    for domain in &config.domains {
-        if domain.enabled {
-            routes.insert(domain.domain.clone(), domain.origin.clone());
-            info!("Loaded: {} -> {}", domain.domain, domain.origin);
-        } else {
-            info!("Skipped (disabled): {}", domain.domain);
+    match database::load_domains(&db).await {
+        Ok(domains) => {
+            for (domain, origin) in domains {
+                routes.insert(domain.clone(), origin.clone());
+                info!("Loaded from DB: {} -> {}", domain, origin);
+            }
+        }
+        Err(e) => {
+            warn!("Failed to load domains from DB: {}", e);
         }
     }
 
@@ -85,20 +106,19 @@ async fn main() {
         rate_limiter,
     };
 
+    //build router
     let api_routes = api_router(app_state.routes.clone(), app_state.db.clone());
 
-    //build router
     let app = Router::new()
         .fallback(proxy_handler)
         .with_state(app_state)
         .nest("/api", api_routes);
 
-
     //start server
-    let addr = format!("{}:{}", config.proxy.host, config.proxy.port);
+    let addr = format!("{}:{}", host, port);
     info!("Proxy started on http://{}", addr);
 
-    let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
+    let listener = tokio::net::TcpListener::bind(&addr).await.unwrap();
     axum::serve(
         listener, 
         app.into_make_service_with_connect_info::<SocketAddr>()

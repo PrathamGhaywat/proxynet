@@ -2,7 +2,7 @@ use axum::{
     extract::{Path, State},
     http::StatusCode,
     response::IntoResponse,
-    routing::{get},
+    routing::get,
     Json, Router,
 };
 use serde::{Deserialize, Serialize};
@@ -10,10 +10,11 @@ use sqlx::SqlitePool;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use std::collections::HashMap;
+use crate::database;
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct DomainDto {
-    pub id: Option<i32>,
+    pub id: Option<i64>,
     pub domain: String,
     pub origin: String,
     pub enabled: bool,
@@ -61,110 +62,155 @@ pub fn api_router(
         .route("/domains", get(list_domains).post(create_domain))
         .route("/domains/{id}", get(get_domain).patch(update_domain).delete(delete_domain))
         .route("/stats", get(get_stats))
+        .route("/config", get(get_all_config_endpoint).post(set_config_endpoint))
+        .route("/config/{key}", get(get_config_endpoint).patch(update_config_endpoint))
         .with_state((routes, db))
 }
 
 async fn list_domains(
-    State((routes, _db)): State<(Arc<RwLock<HashMap<String, String>>>, SqlitePool)>,
+    State((_routes, db)): State<(Arc<RwLock<HashMap<String, String>>>, SqlitePool)>,
 ) -> impl IntoResponse {
-    let routes_lock = routes.read().await;
-    let domains: Vec<DomainDto> = routes_lock
-        .iter()
-        .enumerate()
-        .map(|(idx, (domain, origin))| DomainDto {
-            id: Some(idx as i32),
-            domain: domain.clone(),
-            origin: origin.clone(),
-            enabled: true,
-        })
-        .collect();
-
-    Json(ApiResponse::ok(domains))
+    match database::get_all_domains(&db).await {
+        Ok(domains) => {
+            let dtos: Vec<DomainDto> = domains
+                .into_iter()
+                .map(|(id, domain, origin, enabled)| DomainDto {
+                    id: Some(id),
+                    domain,
+                    origin,
+                    enabled,
+                })
+                .collect();
+            Json(ApiResponse::ok(dtos)).into_response()
+        }
+        Err(_) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ApiResponse::<()>::err("Failed to fetch domains".to_string())),
+        )
+            .into_response(),
+    }
 }
 
 async fn create_domain(
-    State((routes, _db)): State<(Arc<RwLock<HashMap<String, String>>>, SqlitePool)>,
+    State((routes, db)): State<(Arc<RwLock<HashMap<String, String>>>, SqlitePool)>,
     Json(payload): Json<DomainDto>,
 ) -> impl IntoResponse {
-    let mut routes_lock = routes.write().await;
-    routes_lock.insert(payload.domain.clone(), payload.origin.clone());
+    //save to database
+    match database::create_domain(&db, &payload.domain, &payload.origin).await {
+        Ok(id) => {
+            //update in-memory routes
+            let mut routes_lock = routes.write().await;
+            routes_lock.insert(payload.domain.clone(), payload.origin.clone());
 
-    (StatusCode::CREATED, Json(ApiResponse::ok(payload)))
+            let response = DomainDto {
+                id: Some(id),
+                domain: payload.domain,
+                origin: payload.origin,
+                enabled: true,
+            };
+
+            (StatusCode::CREATED, Json(ApiResponse::ok(response))).into_response()
+        }
+        Err(_) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ApiResponse::<()>::err("Failed to create domain".to_string())),
+        )
+            .into_response(),
+    }
 }
 
 async fn get_domain(
-    State((routes, _db)): State<(Arc<RwLock<HashMap<String, String>>>, SqlitePool)>,
-    Path(id): Path<i32>,
+    State((_routes, db)): State<(Arc<RwLock<HashMap<String, String>>>, SqlitePool)>,
+    Path(id): Path<i64>,
 ) -> impl IntoResponse {
-    let routes_lock = routes.read().await;
-    let domain = routes_lock
-        .iter()
-        .enumerate()
-        .find(|(idx, _)| *idx == id as usize)
-        .map(|(_, (domain, origin))| DomainDto {
-            id: Some(id),
-            domain: domain.clone(),
-            origin: origin.clone(),
-            enabled: true,
-        });
-
-    match domain {
-        Some(d) => (StatusCode::OK, Json(ApiResponse::ok(d))).into_response(),
-        None => (
-            StatusCode::NOT_FOUND,
-            Json(ApiResponse::<()>::err("Domain not found".to_string())),
+    match database::get_all_domains(&db).await {
+        Ok(domains) => {
+            if let Some((id, domain, origin, enabled)) = domains.iter().find(|(d_id, _, _, _)| *d_id == id) {
+                let dto = DomainDto {
+                    id: Some(*id),
+                    domain: domain.clone(),
+                    origin: origin.clone(),
+                    enabled: *enabled,
+                };
+                (StatusCode::OK, Json(ApiResponse::ok(dto))).into_response()
+            } else {
+                (
+                    StatusCode::NOT_FOUND,
+                    Json(ApiResponse::<()>::err("Domain not found".to_string())),
+                )
+                    .into_response()
+            }
+        }
+        Err(_) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ApiResponse::<()>::err("Failed to fetch domain".to_string())),
         )
             .into_response(),
     }
 }
 
 async fn update_domain(
-    State((routes, _db)): State<(Arc<RwLock<HashMap<String, String>>>, SqlitePool)>,
-    Path(id): Path<i32>,
+    State((routes, db)): State<(Arc<RwLock<HashMap<String, String>>>, SqlitePool)>,
+    Path(id): Path<i64>,
     Json(payload): Json<DomainDto>,
 ) -> impl IntoResponse {
-    let mut routes_lock = routes.write().await;
+    //update database
+    match database::update_domain(&db, id, &payload.domain, &payload.origin).await {
+        Ok(_) => {
+            //update in-memory routes
+            let mut routes_lock = routes.write().await;
 
-    let old_domain = routes_lock
-        .iter()
-        .enumerate()
-        .find(|(idx, _)| *idx == id as usize)
-        .map(|(_, (d, _))| d.clone());
+            //find and remove old domain
+            if let Some(domains) = database::get_all_domains(&db).await.ok() {
+                if let Some((_, old_domain, _, _)) = domains.iter().find(|(d_id, _, _, _)| *d_id == id) {
+                    routes_lock.remove(old_domain);
+                }
+            }
 
-    if let Some(old_domain) = old_domain {
-        routes_lock.remove(&old_domain);
-        routes_lock.insert(payload.domain.clone(), payload.origin.clone());
-        (StatusCode::OK, Json(ApiResponse::ok(payload))).into_response()
-    } else {
-        (
-            StatusCode::NOT_FOUND,
-            Json(ApiResponse::<()>::err("Domain not found".to_string())),
+            //add new domain
+            routes_lock.insert(payload.domain.clone(), payload.origin.clone());
+
+            let response = DomainDto {
+                id: Some(id),
+                domain: payload.domain,
+                origin: payload.origin,
+                enabled: true,
+            };
+
+            (StatusCode::OK, Json(ApiResponse::ok(response))).into_response()
+        }
+        Err(_) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ApiResponse::<()>::err("Failed to update domain".to_string())),
         )
-            .into_response()
+            .into_response(),
     }
 }
 
 async fn delete_domain(
-    State((routes, _db)): State<(Arc<RwLock<HashMap<String, String>>>, SqlitePool)>,
-    Path(id): Path<i32>,
+    State((routes, db)): State<(Arc<RwLock<HashMap<String, String>>>, SqlitePool)>,
+    Path(id): Path<i64>,
 ) -> impl IntoResponse {
-    let mut routes_lock = routes.write().await;
+    //delete from database
+    match database::delete_domain(&db, id).await {
+        Ok(_) => {
+            //remove from in-memory routes
+            let mut routes_lock = routes.write().await;
 
-    let domain_to_delete = routes_lock
-        .iter()
-        .enumerate()
-        .find(|(idx, _)| *idx == id as usize)
-        .map(|(_, (d, _))| d.clone());
+            //find domain to remove
+            if let Some(domains) = database::get_all_domains(&db).await.ok() {
+                if let Some((_, domain, _, _)) = domains.iter().find(|(d_id, _, _, _)| *d_id == id) {
+                    routes_lock.remove(domain);
+                }
+            }
 
-    if let Some(domain) = domain_to_delete {
-        routes_lock.remove(&domain);
-        (StatusCode::NO_CONTENT, "").into_response()
-    } else {
-        (
-            StatusCode::NOT_FOUND,
-            Json(ApiResponse::<()>::err("Domain not found".to_string())),
+            (StatusCode::NO_CONTENT, "").into_response()
+        }
+        Err(_) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ApiResponse::<()>::err("Failed to delete domain".to_string())),
         )
-            .into_response()
+            .into_response(),
     }
 }
 
@@ -208,4 +254,84 @@ async fn get_stats(
     };
 
     Json(ApiResponse::ok(stats))
+}
+
+async fn get_all_config_endpoint(
+    State((_routes, db)): State<(Arc<RwLock<HashMap<String, String>>>, SqlitePool)>,
+) -> impl IntoResponse {
+    match crate::database::get_all_config(&db).await {
+        Ok(config) => {
+            let config_map: std::collections::HashMap<String, String> = config.into_iter().collect();
+            Json(ApiResponse::ok(config_map)).into_response()
+        }
+        Err(_) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ApiResponse::<()>::err("Failed to fetch config".to_string())),
+        )
+            .into_response(),
+    }
+}
+
+async fn get_config_endpoint(
+    State((_routes, db)): State<(Arc<RwLock<HashMap<String, String>>>, SqlitePool)>,
+    Path(key): Path<String>,
+) -> impl IntoResponse {
+    match crate::database::get_config(&db, &key).await {
+        Ok(Some(value)) => {
+            let mut config = std::collections::HashMap::new();
+            config.insert(key, value);
+            Json(ApiResponse::ok(config)).into_response()
+        }
+        Ok(None) => (
+            StatusCode::NOT_FOUND,
+            Json(ApiResponse::<()>::err("Config key not found".to_string())),
+        )
+            .into_response(),
+        Err(_) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ApiResponse::<()>::err("Failed to fetch config".to_string())),
+        )
+            .into_response(),
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct ConfigUpdate {
+    value: String,
+}
+
+async fn update_config_endpoint(
+    State((_routes, db)): State<(Arc<RwLock<HashMap<String, String>>>, SqlitePool)>,
+    Path(key): Path<String>,
+    Json(payload): Json<ConfigUpdate>,
+) -> impl IntoResponse {
+    match crate::database::set_config(&db, &key, &payload.value).await {
+        Ok(_) => {
+            let mut config = std::collections::HashMap::new();
+            config.insert(key, payload.value);
+            Json(ApiResponse::ok(config)).into_response()
+        }
+        Err(_) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ApiResponse::<()>::err("Failed to update config".to_string())),
+        )
+            .into_response(),
+    }
+}
+
+async fn set_config_endpoint(
+    State((_routes, db)): State<(Arc<RwLock<HashMap<String, String>>>, SqlitePool)>,
+    Json(payload): Json<std::collections::HashMap<String, String>>,
+) -> impl IntoResponse {
+    for (key, value) in payload.iter() {
+        if let Err(_) = crate::database::set_config(&db, key, value).await {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ApiResponse::<()>::err("Failed to update config".to_string())),
+            )
+                .into_response();
+        }
+    }
+
+    Json(ApiResponse::ok(payload)).into_response()
 }
