@@ -61,13 +61,21 @@ async fn main() {
         .parse::<u16>()
         .unwrap_or(8080);
 
+    let api_port = database::get_config(&db, "api_port")
+        .await
+        .ok()
+        .flatten()
+        .unwrap_or("8081".to_string())
+        .parse::<u16>()
+        .unwrap_or(8081);
+
     let rate_limit = database::get_config(&db, "rate_limit_per_minute")
         .await
         .ok()
         .flatten()
         .and_then(|s| s.parse::<u32>().ok());
 
-    info!("Loaded config from database: {}:{}, rate_limit: {:?}", host, port, rate_limit);
+    info!("Loaded config from database: {}:{}, api_port: {}, rate_limit: {:?}", host, port, api_port, rate_limit);
 
     //init in-memory cache
     let cache = MemoryCache::new();
@@ -101,31 +109,54 @@ async fn main() {
     let app_state = AppState {
         routes: Arc::new(RwLock::new(routes)),
         client,
-        db,
+        db: db.clone(),
         cache,
         rate_limiter,
     };
 
-    //build router
-    let api_routes = api_router(app_state.routes.clone(), app_state.db.clone());
-
-    let app = Router::new()
+    //build proxy router
+    let proxy_app = Router::new()
         .fallback(proxy_handler)
-        .with_state(app_state)
-        .nest("/api", api_routes);
+        .with_state(app_state.clone());
 
-    //start server
-    let addr = format!("{}:{}", host, port);
-    info!("Proxy started on http://{}", addr);
+    //build API router
+    let api_app = api_router(app_state.routes.clone(), db.clone());
 
-    let listener = tokio::net::TcpListener::bind(&addr).await.unwrap();
-    axum::serve(
-        listener, 
-        app.into_make_service_with_connect_info::<SocketAddr>()
-    )
-    .await
-    .unwrap();
+    //start proxy server
+    let proxy_addr = format!("{}:{}", host, port);
+    info!("Proxy server started on http://{}", proxy_addr);
+
+    let proxy_listener = tokio::net::TcpListener::bind(&proxy_addr).await.unwrap();
+    let proxy_server = axum::serve(
+        proxy_listener, 
+        proxy_app.into_make_service_with_connect_info::<SocketAddr>()
+    );
+
+    //start API server
+    let api_addr = format!("{}:{}", host, api_port);
+    info!("API server started on http://{}", api_addr);
+
+    let api_listener = tokio::net::TcpListener::bind(&api_addr).await.unwrap();
+    let api_server = axum::serve(
+        api_listener,
+        api_app.into_make_service()
+    );
+
+    //run both servers concurrently
+    tokio::select! {
+        result = proxy_server => {
+            if let Err(e) = result {
+                warn!("Proxy server error: {}", e);
+            }
+        }
+        result = api_server => {
+            if let Err(e) = result {
+                warn!("API server error: {}", e);
+            }
+        }
+    }
 }
+
 async fn proxy_handler(
     State(state): State<AppState>,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
