@@ -353,7 +353,7 @@ If changes don't apply, check:
 
 ---
 
-## Next Steps
+## Future Improvements
 
 - Add TLS/HTTPS support
 - Implement cache TTL and eviction policies
