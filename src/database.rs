@@ -1,6 +1,6 @@
 use sqlx::{sqlite::SqlitePool, Row};
 use crate::logger::RequestLog;
-use chrono::Utc;
+use crate::api::DomainDto;
 
 pub async fn init_db() -> Result<SqlitePool, sqlx::Error> {
     let database_url = "sqlite:proxynet.db";
@@ -71,90 +71,118 @@ pub async fn init_db() -> Result<SqlitePool, sqlx::Error> {
     Ok(pool)
 }
 
-pub async fn load_domains(pool: &SqlitePool) -> Result<Vec<(String, String)>, sqlx::Error> {
-    let rows = sqlx::query(
+pub async fn load_domains(db: &SqlitePool) -> Result<Vec<(String, String)>, sqlx::Error> {
+    sqlx::query_as::<_, (String, String)>(
         "SELECT domain, origin FROM domains WHERE enabled = 1"
     )
-    .fetch_all(pool)
-    .await?;
-
-    Ok(rows
-        .into_iter()
-        .map(|row| {
-            let domain: String = row.get("domain");
-            let origin: String = row.get("origin");
-            (domain, origin)
-        })
-        .collect())
+    .fetch_all(db)
+    .await
 }
 
 pub async fn create_domain(
-    pool: &SqlitePool,
+    db: &SqlitePool,
     domain: &str,
     origin: &str,
-) -> Result<i64, sqlx::Error> {
-    let now = Utc::now().timestamp();
-    sqlx::query(
-        "INSERT INTO domains (domain, origin, enabled, created_at, updated_at) VALUES (?, ?, 1, ?, ?)"
+) -> Result<DomainDto, sqlx::Error> {
+    let now = chrono::Utc::now().timestamp();
+    
+    sqlx::query("INSERT INTO domains (domain, origin, enabled, created_at, updated_at) VALUES (?, ?, ?, ?, ?)")
+        .bind(domain)
+        .bind(origin)
+        .bind(true)
+        .bind(now)
+        .bind(now)
+        .execute(db)
+        .await?;
+
+    let result = sqlx::query_as::<_, (i64, String, String, bool)>(
+        "SELECT id, domain, origin, enabled FROM domains WHERE domain = ? ORDER BY id DESC LIMIT 1"
     )
     .bind(domain)
-    .bind(origin)
-    .bind(now)
-    .bind(now)
-    .execute(pool)
+    .fetch_one(db)
     .await?;
 
-    Ok(sqlx::query_scalar::<_, i64>("SELECT last_insert_rowid()")
-        .fetch_one(pool)
-        .await?)
+    Ok(DomainDto {
+        id: Some(result.0),
+        domain: result.1,
+        origin: result.2,
+        enabled: result.3,
+    })
 }
 
 pub async fn update_domain(
-    pool: &SqlitePool,
+    db: &SqlitePool,
     id: i64,
     domain: &str,
     origin: &str,
-) -> Result<(), sqlx::Error> {
-    let now = Utc::now().timestamp();
-    sqlx::query(
-        "UPDATE domains SET domain = ?, origin = ?, updated_at = ? WHERE id = ?"
+) -> Result<DomainDto, sqlx::Error> {
+    let now = chrono::Utc::now().timestamp();
+    
+    sqlx::query("UPDATE domains SET domain = ?, origin = ?, updated_at = ? WHERE id = ?")
+        .bind(domain)
+        .bind(origin)
+        .bind(now)
+        .bind(id)
+        .execute(db)
+        .await?;
+
+    let result = sqlx::query_as::<_, (i64, String, String, bool)>(
+        "SELECT id, domain, origin, enabled FROM domains WHERE id = ?"
     )
-    .bind(domain)
-    .bind(origin)
-    .bind(now)
     .bind(id)
-    .execute(pool)
+    .fetch_one(db)
     .await?;
 
-    Ok(())
+    Ok(DomainDto {
+        id: Some(result.0),
+        domain: result.1,
+        origin: result.2,
+        enabled: result.3,
+    })
 }
 
-pub async fn delete_domain(pool: &SqlitePool, id: i64) -> Result<(), sqlx::Error> {
+pub async fn delete_domain(db: &SqlitePool, id: i64) -> Result<(), sqlx::Error> {
     sqlx::query("DELETE FROM domains WHERE id = ?")
         .bind(id)
-        .execute(pool)
+        .execute(db)
         .await?;
 
     Ok(())
 }
 
-pub async fn get_all_domains(pool: &SqlitePool) -> Result<Vec<(i64, String, String, bool)>, sqlx::Error> {
-    let rows = sqlx::query(
+pub async fn get_domain_by_id(db: &SqlitePool, id: i64) -> Result<Option<DomainDto>, sqlx::Error> {
+    sqlx::query_as::<_, (i64, String, String, bool)>(
+        "SELECT id, domain, origin, enabled FROM domains WHERE id = ?"
+    )
+    .bind(id)
+    .fetch_optional(db)
+    .await
+    .map(|opt| {
+        opt.map(|(id, domain, origin, enabled)| DomainDto {
+            id: Some(id),
+            domain,
+            origin,
+            enabled,
+        })
+    })
+}
+
+pub async fn get_all_domains(db: &SqlitePool) -> Result<Vec<DomainDto>, sqlx::Error> {
+    sqlx::query_as::<_, (i64, String, String, bool)>(
         "SELECT id, domain, origin, enabled FROM domains"
     )
-    .fetch_all(pool)
-    .await?;
-
-    Ok(rows
-        .into_iter()
-        .map(|row| {
-            let id: i64 = row.get("id");
-            let domain: String = row.get("domain");
-            let origin: String = row.get("origin");
-            let enabled: bool = row.get("enabled");
-            (id, domain, origin, enabled)
-        })
-        .collect())
+    .fetch_all(db)
+    .await
+    .map(|rows| {
+        rows.into_iter()
+            .map(|(id, domain, origin, enabled)| DomainDto {
+                id: Some(id),
+                domain,
+                origin,
+                enabled,
+            })
+            .collect()
+    })
 }
 
 pub async fn save_log(pool: &SqlitePool, log: &RequestLog) -> Result<(), sqlx::Error> {
