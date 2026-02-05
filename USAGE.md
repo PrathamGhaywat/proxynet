@@ -4,6 +4,7 @@ ProxyNet is a Cloudflare alternative reverse proxy built in Rust with in-memory 
 
 ## Quick Start
 Assuming you have Rust installed and have cloned the repository, follow these steps to get started:
+(As of now only tested in Windows, probabyl won't work on Linux/Mac without some tweaks to file paths and commands)
 ### 1. Start the Servers
 
 ```bash
