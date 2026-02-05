@@ -3,7 +3,7 @@
 ProxyNet is a Cloudflare alternative reverse proxy built in Rust with in-memory caching, database logging, and dynamic route management.
 
 ## Quick Start
-
+Assuming you have Rust installed and have cloned the repository, follow these steps to get started:
 ### 1. Start the Servers
 
 ```bash
